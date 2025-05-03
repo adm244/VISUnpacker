@@ -1,0 +1,243 @@
+/*
+    Engine version: 5.3.1 build 1239, Apr 22 2024
+    TCPDebuggerClient port: 40001
+    Script languages: Lua, Ilios (for components)
+
+    player args:
+        -dec <filename>         : decode savegame
+        -r <resolution>         : set game resolution
+        -language <string>      : set game languange
+        -savegame <string>      : load savegame file
+        -deb <hostname>:<port>  : debugger network address
+        -lf <filename>          : set logging file
+        -ll <level>             : set logging level
+        -nv ???
+        -ns ???
+        -tc ???
+        -re ???
+        -w ???
+        -net                    : load game files from network
+        -doc                    : generate lua documentation and exit
+        -sp <filepath>          : set standard filepath
+        -prof <lua\frame>       : set profiler type
+        -sc <name>              : starting (first) scene name
+
+    Config settings:
+        # Game language string
+            Language = <string>
+        # Filepath to game archive
+            File = <string>
+        # Music volume
+            MusicVolume = <long>
+        # Sounds volume
+            SoundVolume = <long>
+        # Speech volume
+            SpeechVolume = <long>
+        # Pre-rendered videos volume
+            MovieVolume = <long>
+        # Master volume
+            GlobalVolume = <long>
+        # Run game in fullscreen
+            Fullscreen = <Yes\No>
+        # Should game window be resizeable or not
+            Resizeable = <Yes\No>
+        # Play intro videos or not ?
+            Intro = <Yes\No>
+        # Game window resolution
+            Resolution = <Desktop\Game\Auto> or <long>x<long>
+        # Does game use texture compression
+            UseTextureCompression = <Enabled\Disabled>
+        # Brightness level
+            Brightness = <long>
+        # Logging level
+            LogLevel = <Error\Warning\Info\Max>
+        # Should mouse cursor be locked inside game window or not
+            LockCursor = <Enabled\Disabled>
+        # Graphics rendering backend
+            Device = <DX9\DX11\DX12\OGL\Metal>
+        # Custom game archive password (to decrypt composed files)
+            Password = <string>
+
+    passw = "AGAME4VISPL4"
+    savegame_passw = "SAVEGAMEPWD30"
+    VIS5 games are compiled
+    VIS3 games are not(?) compiled
+
+    TComposedFile (VIS file structure):
+    char[4] signature = "VIS5"
+    BE int32 count (1_000_000 max)
+
+    entries_table:
+        (encrypted by XOR with md5 hash hex-string of a passphrase "AGAME4VISPL4")
+        char[3] start_marker = "HDR"
+        entry:
+            BE uint32[count] s_hashes (for VIS5 only)
+            SEntryInfo2[count] s_files
+        char[3] end_marker = "END"
+
+    VIS5 is using joaat64 (truncated to 32-bit) hashes of filenames instead of
+      actual filenames in files table
+    In order to extract files you have to parse TVedFile ("game.veb") file to get filenames
+    Moreover, you need filenames to decrypt any encrypted files (or parts of them) stored in .vis
+
+    SEntryInfo2:
+        BE uint32 value?
+        BE uint32 offset (offset into file)
+        BE uint32 size
+        BE int32 flags (0x8 -- encrypted\tempered with, used for PNG files)
+                       (0x2 -- fully(?) encrypted, used for non-binary XML project file (TVedFile))
+                       (0x10 -- zlib compressed chunks, used for XML project file)
+            (encrypted files are decrypted by XOR with md5 hash hex-string of filename without extension
+             OR 'passw' phrase)
+
+    VIS5 (compiled) contains "game.veb" file (class called "ved" not "veb" for some reason)
+      (maybe "b" stands for "binary"?)
+      ("ved" file is just XML, so "veb" is XML represented as binary data)
+    Index for it can be found by calculating a joaat64 hash (truncated to 32-bit) of a filename
+      and looking for it in "s_hashes" table, then use this index into "s_files" table
+      to find offset and size of a file (also some flags and data(?))
+
+    TVedFile: (header + data)
+        char[4] signature = "VBIN" (or ???)
+        LE uint32 ???
+        LE uint32 uncompressed_size
+        LE uint32 size
+        <...> (zlib compressed data (bin_structure + data))
+
+    bin_structure:
+        LE uint16 tag_id (950 max)
+        LE uint16 subtags_count (1000 max)
+        bin_structure[subtags_count] (recursive)
+        <...> (data)
+            (bin_structure only describes objects layouts, NOT how data laid out in veb file)
+
+    TGameControl::PreLoad loads only "Game" and "Loadings" tables (both happen to be first in ve(b|d) file)
+      (loadingType == 0)
+    TGameControl::LoadAndInitGame loads all tables
+      (loadingType == 1)
+    TGameControl::LoadGame resets previously loaded tables data and loads all tables
+      (loadingType == 2)
+      (???) Savefiles are also in ve(b|d) format but don't have "TVedFile" header and are not(?) compressed?
+
+    Tables data parsed according to data type for its tag id; accepted tag ids are:
+        [12-14,55-99,100-949]
+      NOTE that range [56-99] seems to be UNDEFINED in runtime
+        AND ranges [17,53-54] are IGNORED by runtime (used only for editor)
+    Tag ids for direct children of root MUST BE table tag ids (Game,Loadings,etc...)
+    Tables have their own header; some of which have special headers
+
+    VisionaireAdventure (special, no table, different header, tag_id: 0x64 (100))
+        LE optional uint8[4] signature = 0x06054ab6
+        LE int32 project_type = -1
+        LE int32 project_revision = -1
+        LE int32 engine_version = 204
+        <...> (tables data based on bin_structure)
+
+    Project Types: Default (-1) -- not "team" shared
+    Project Revision only present if project is "team" shared
+
+    Game table (special, id: -1, different header, tag_id: 0x74 (116))
+        LE int32 last_modified = -1 (present only if VisionaireAdventure has signature)
+        <...> (game table data according to bin_structure with tag_id: 116)
+
+    Other tables (id: [0..43], tag_id: {101,102,103,104,105,106,107,108,109,110,
+                                        111,112,113,114,115,225,254,260,262,265,
+                                        326,351,390,449,557,569,636,649,657,672,
+                                        676,704,816,828,833,858,868,871,893,897, <...>})
+        LE optional uint8[4] signature = 0x06054ab6
+        LE optional uint32 versionedId (present only if header has signature)
+        LE int32 elements_count
+        Element[elements_count]
+
+    Element:
+        <...> (data based on bin_structure, including special tags (if any))
+
+
+    ========================
+    === Special tag ids  ===
+    ========================
+
+    Tag 12:
+        String name
+    Tag 13:
+        int32 id
+    Tag 14:
+        int32 order
+    Tag 17:
+        int32 engine_version
+    Tag 53:
+        int32 project_type
+    Tag 54:
+        int32 project_revision
+    Tag 55:
+        uint32 last_modified
+
+
+    ========================
+    ====== Data Types ======
+    ========================
+
+    Bool:
+        uint8 value
+    Int, Float:
+        LE int32\float32 value
+    String, Path:
+        LE uint32 length
+        char[length] data
+        (data has null-terminator which is included in length)
+    0x5, 0x13: ???
+    VRect:
+        LE int32 count
+        Rect[count] data
+    VSprite:
+        LE int32 count
+        Sprite[count] data
+    VPoint:
+        LE int32 count
+        Point[count] data
+    VString:
+        LE int32 count
+        String[count] data
+    VInt:
+        LE int32 count
+        int32[count] data
+    VPath:
+        LE int32 count
+        Path[count] data
+    VFloat:
+        LE int32 count
+        float32[count] data
+    Point:
+        LE int32 x
+        LE int32 y
+    Rect:
+        LE int32 x
+        LE int32 y
+        LE int32 width
+        LE int32 height
+    Sprite: size?
+        Path filepath
+        LE int32 pause_state
+        String name
+        Point position
+        LE uint32[2] reserved
+    Link:
+        LE int32 id
+        LE int32 table_id
+        int8 is_any_link
+        int8 is_parent
+    Links:
+        LE int32 count
+        Link[count] data
+    VText:
+        LE int32 count
+        TTextLanguage[count] data
+    VBool:
+        LE int32 count
+        uint8[(int)count/8 + 1] (packed bits, maybe null-terminated?)
+
+    TTextLanguage:
+        String text
+        Path sound_filepath
+        int32 languageId
+*/
